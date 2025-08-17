@@ -8,11 +8,11 @@ readonly DOWNLOAD_DIR="$HOME/.AppImage"
 readonly ICON_DIR="$HOME/.local/share/icons"
 readonly USER_DESKTOP_FILE="$HOME/Desktop/cursor.desktop"
 readonly DOWNLOAD_URL="https://downloader.cursor.sh/linux/appImage/x64"
-readonly ICON_URL="https://mintlify.s3-us-west-1.amazonaws.com/cursor/images/logo/app-logo.svg"
+readonly ICON_URL="https://cursor.com/favicon.svg"
 readonly VERSION_CHECK_TIMEOUT=5 # in seconds | if you have a slow connection, increase this value to 10, 15, or more
 readonly SPINNERS=("meter" "line" "dot" "minidot" "jump" "pulse" "points" "globe" "moon" "monkey" "hamburger")
 readonly SPINNER="${SPINNERS[0]}"
-readonly DEPENDENCIES=("gum" "curl" "wget" "pv" "bc" "find:findutils" "chmod:coreutils" "timeout:coreutils" "mkdir:coreutils" "apparmor_parser:apparmor-utils")
+readonly DEPENDENCIES=("jq:jq", "gum" "curl" "wget" "pv" "bc" "find:findutils" "chmod:coreutils" "timeout:coreutils" "mkdir:coreutils" "apparmor_parser:apparmor-utils")
 readonly GUM_VERSION_REQUIRED="0.14.5"
 readonly SYSTEM_DESKTOP_FILE="$HOME/.local/share/applications/cursor.desktop"
 readonly APPARMOR_PROFILE="/etc/apparmor.d/cursor-appimage"
@@ -42,6 +42,20 @@ remote_version=""
 remote_md5=""
 
 # Utility Functions
+detect_distro() {
+  os_name=$(grep -E '^NAME=' /etc/os-release | cut -d= -f2 | tr -d '"')
+  if grep -qiE 'ubuntu|debian' /etc/os-release; then
+    PM_UPDATE='sudo apt update -y'
+    PM_INSTALL='sudo apt install -y --allow-downgrades'
+  elif grep -qiE 'fedora' /etc/os-release; then
+    PM_UPDATE='sudo dnf makecache'
+    PM_INSTALL='sudo dnf install -y'
+  else
+    logg error "SO não suportado: $os_name. Saindo…"; exit 1
+  fi
+  logg success "Detectado $os_name. Usando $PM_INSTALL" 
+}
+
 validate_os() {
   local os_name
   spinner "Checking system compatibility..." "sleep 1"
@@ -70,8 +84,8 @@ install_script_alias() {
     echo "     │  $ ${SCRIPT_ALIAS_NAME}    │"
     echo "     ╰────────────────────╯"
     echo ""
-    read -rp "   Press any key to close this terminal..." -n1
-    kill -9 $PPID
+    read -rp "   Press any key to continue..." -n1
+    return 0
   else
     logg success "The alias '${SCRIPT_ALIAS_NAME}' is already configured. No changes were made."
   fi
@@ -80,32 +94,57 @@ install_script_alias() {
 check_and_install_dependencies() {
   spinner "Checking dependencies..." "sleep 1"
   local missing_packages=()
+
+  # 1. Detect missing commands/packages
   for dep_info in "${DEPENDENCIES[@]}"; do
-    local dep="${dep_info%%:*}" package="${dep_info#*:}"
-    [[ "$package" == "$dep" ]] && package=""
-    command -v "$dep" >/dev/null 2>&1 || missing_packages+=("${package:-$dep}")
+    local dep="${dep_info%%:*}" pkg="${dep_info#*:}"
+    [[ "$pkg" == "$dep" ]] && pkg=""
+    command -v "$dep" >/dev/null 2>&1 || missing_packages+=("${pkg:-$dep}")
   done
 
+  # 2. Enforce gum version (only pin on Debian/Ubuntu)
   local gum_installed_version
   if command -v gum >/dev/null 2>&1; then
     gum_installed_version=$(gum --version 2>/dev/null | grep -oP '\d+\.\d+\.\d+')
     if [[ "$gum_installed_version" != "$GUM_VERSION_REQUIRED" ]]; then
-      logg warn "Detected gum version $gum_installed_version. Downgrading to the more stable version $GUM_VERSION_REQUIRED due to known issues installed version."
+      logg warn "Detected gum version $gum_installed_version. Pinning to $GUM_VERSION_REQUIRED."
       missing_packages+=("gum=$GUM_VERSION_REQUIRED")
     fi
   else
     missing_packages+=("gum=$GUM_VERSION_REQUIRED")
   fi
 
+  # 3. If there is anything to install…
   if [[ "${#missing_packages[@]}" -gt 0 ]]; then
     logg prompt "Installing or downgrading: ${missing_packages[*]}"
-    sudo mkdir -p /etc/apt/keyrings
-    curl -fsSL https://repo.charm.sh/apt/gpg.key | sudo gpg --batch --yes --dearmor -o /etc/apt/keyrings/charm.gpg
-    echo "deb [signed-by=/etc/apt/keyrings/charm.gpg] https://repo.charm.sh/apt/ * *" | sudo tee /etc/apt/sources.list.d/charm.list
-    sudo apt update -y && sudo apt install -y --allow-downgrades "${missing_packages[@]}"
+
+    if [[ "$PM_INSTALL" == *apt* ]]; then
+      # Debian/Ubuntu: add Charm repo, then install
+      sudo mkdir -p /etc/apt/keyrings
+      curl -fsSL https://repo.charm.sh/apt/gpg.key \
+        | sudo gpg --batch --yes --dearmor -o /etc/apt/keyrings/charm.gpg
+      echo "deb [signed-by=/etc/apt/keyrings/charm.gpg] https://repo.charm.sh/apt/ * *" \
+        | sudo tee /etc/apt/sources.list.d/charm.list >/dev/null
+      $PM_UPDATE
+      $PM_INSTALL "${missing_packages[@]}"
+
+    else
+      # Fedora: strip version pins and skip AppArmor tools
+      local f_packages=()
+      for pkg in "${missing_packages[@]}"; do
+        [[ "$pkg" == "apparmor-utils" ]] && continue   # Fedora doesn’t use AppArmor
+        f_packages+=( "${pkg%%=*}" )                   # remove "=version" if present
+      done
+      missing_packages=("${f_packages[@]}")
+      $PM_UPDATE
+      [[ "${#missing_packages[@]}" -gt 0 ]] && $PM_INSTALL "${missing_packages[@]}"
+    fi
+
   fi
+
   logg success "All dependencies are good to go!"
 }
+
 
 show_banner() { clear; gum style --border double --border-foreground="$CLR_PRI" --margin "1 0 2 2" --padding "1 3" --align center --foreground="$CLR_LGT" --background="$CLR_BG" "$(echo -e "🧙 Welcome to the Cursor Setup Wizard! 🎉\n 📡 Effortlessly fetch, download, and configure Cursor. 🔧")"; }
 
@@ -168,23 +207,18 @@ logg() {
 }
 
 fetch_remote_version() {
-  logg prompt "Looking for the latest version online..."
-  headers=$(spinner "Fetching version info from the server..." \
-    "sleep 1 && timeout \"$VERSION_CHECK_TIMEOUT\" wget -S \"$DOWNLOAD_URL\" -q -O /dev/null 2>&1 || true")
-  if [[ -z "$headers" ]]; then
-    logg error "$(echo -e "Failed to fetch headers from the server.\n   • Ensure your internet connection is active and stable.\n   • Ensure that 'VERSION_CHECK_TIMEOUT' ($VERSION_CHECK_TIMEOUT sec) is set high enough to retrieve the headers.\n   • Also, verify if 'DOWNLOAD_URL' is correct: $DOWNLOAD_URL.\n\n ")"
-    return 1
-  fi
-  logg success "Latest version details retrieved successfully."
-  remote_name=$(echo "$headers" | grep -oE 'filename="[^"]+"' | sed 's/filename=//g; s/\"//g') || remote_name=""
-  remote_size=$(echo "$headers" | grep -oE 'Content-Length: [0-9]+' | sed 's/Content-Length: //') || remote_size="0"
-  remote_version=$(extract_version "$remote_name")
-  remote_md5=$(echo "$headers" | grep -oE 'ETag: "[^"]+"' | sed 's/ETag: //; s/"//g' || echo "unknown")
-  if [[ -z "$remote_name" ]]; then
-    logg error "Could not fetch the filename info. Please check that the 'DOWNLOAD_URL' variable is correct and try again."
-    return 1
-  fi
-  logg info "$(echo -e "Latest version online:\n      - name: $remote_name\n      - version: $remote_version\n      - size: $(convert_to_mb "$remote_size")\n      - MD5 Hash: $remote_md5\n")"
+  logg prompt "Fetching latest metadata from Cursor API..."
+  # chame a API e capture JSON
+  local api_json
+  api_json=$(curl -s \
+    'https://cursor.com/api/download?platform=linux-x64&releaseTrack=stable' \
+    -H 'accept: */*')
+
+  # parse
+  remote_version=$(echo "$api_json" | jq -r '.version')
+  remote_url=$(echo "$api_json"     | jq -r '.downloadUrl')
+  remote_name=$(basename "$remote_url")
+  logg success "Latest version: $remote_version ($remote_name)"
 }
 
 find_local_version() {
@@ -215,28 +249,33 @@ download_logo() {
 }
 
 download_appimage() {
-  logg prompt "Starting the download of the latest version..."
-  local output_document="$DOWNLOAD_DIR/$remote_name"
-  if command -v pv >/dev/null; then
-    if [[ "$remote_size" =~ ^[0-9]+$ ]]; then
-      wget --quiet --content-disposition -O - "$DOWNLOAD_URL" | pv -s "$remote_size" >"$output_document"
-    else
-      logg warn "Couldn't determine file size. Proceeding with a standard download."
-      spinner "Downloading AppImage" "wget --quiet --content-disposition --output-document=\"$output_document\" \"$DOWNLOAD_URL\""
-    fi
+  logg prompt "Downloading Cursor AppImage $remote_version..."
+  mkdir -p "$DOWNLOAD_DIR"
+  local output="$DOWNLOAD_DIR/$remote_name"
+
+  # 1. Tenta obter Content-Length e limpar CR/LF
+  local content_length
+  content_length=$(curl -sI "$remote_url" \
+    | tr -d '\r' \
+    | awk '/^[Cc]ontent-Length: [0-9]+/{print $2}')
+
+  # 2. Se pv existe E temos um valor numérico, use pv
+  if command -v pv >/dev/null 2>&1 && [[ "$content_length" =~ ^[0-9]+$ ]]; then
+    curl -L "$remote_url" \
+      | pv -s "$content_length" \
+      > "$output"
   else
-    if ! spinner "Downloading AppImage" "wget --quiet --show-progress --content-disposition --output-document=\"$output_document\" --trust-server-names \"$DOWNLOAD_URL\""; then
-      logg error "AppImage download failed. Please try again."
-      return 1
-    fi
+    # fallback para wget sem progress bar avançado
+    wget --quiet --content-disposition -O "$output" "$remote_url"
   fi
-  logg info "Adjusting permissions for the AppImage..."
+
+  # 3. Permissões
+  logg info "Setting executable bit on $output..."
   sudo_please
-  if spinner "Setting permissions for the AppImage" "sleep 2 && echo \"$sudo_pass\" | sudo -S chmod +x \"$output_document\""; then
-    logg success "Permissions updated for the new AppImage."
-  fi
-  local_path="$output_document"
-  logg success "Download complete, and permissions are set!"
+  echo "$sudo_pass" | sudo -S chmod +x "$output"
+  local_path="$output"
+
+  logg success "Downloaded and marked executable: $output"
 }
 
 setup_launchers() {
@@ -323,7 +362,11 @@ menu() {
           download_appimage
           download_logo
           setup_launchers
-          configure_apparmor
+	  if grep -qi 'fedora' /etc/os-release; then
+  	    logg info "Pular AppArmor (Fedora usa SELinux)."
+	  else
+  	    configure_apparmor
+	  fi
           add_cli_command
         else
           find_local_version true
@@ -372,7 +415,8 @@ main() {
   clear
   echo ""
   SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
-  validate_os
+  detect_distro
+  #validate_os
   install_script_alias
   check_and_install_dependencies
   spinner "Initializing the setup wizard..." "sleep 1"
